@@ -1,0 +1,98 @@
+import geopandas as gpd
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+from rasterio.features import rasterize
+from rasterio.transform import from_bounds
+import networkx as nx
+from shapely.geometry import LineString
+
+# Load shapefiles
+land_use = gpd.read_file("data/land_use.shp")
+land_cover = gpd.read_file("data/land_cover.shp")
+conservation_areas = gpd.read_file("data/conservation_areas.shp")
+building_footprints = gpd.read_file("data/building_footprints.shp")
+rivers = gpd.read_file("data/rivers.shp")
+railroads = gpd.read_file("data/railroad_lines.shp")
+street_center_lines = gpd.read_file("data/street_center_lines.shp")
+street_edge = gpd.read_file("data/street_edge.shp")
+
+# Define study area bounds
+bounds = land_cover.total_bounds  # Adjust to encompass all datasets
+resolution = 100  # Resolution of 100 meters per pixel
+width = int((bounds[2] - bounds[0]) / resolution)
+height = int((bounds[3] - bounds[1]) / resolution)
+
+# Create an empty cost surface
+transform = from_bounds(bounds[0], bounds[1], bounds[2], bounds[3], width, height)
+cost_surface = np.ones((height, width), dtype=np.float32)
+
+# Helper function to rasterize a layer
+def rasterize_layer(layer, transform, shape, cost):
+    return rasterize(
+        [(geom, cost) for geom in layer.geometry],
+        out_shape=shape,
+        transform=transform,
+        fill=1  # Default cost for areas not covered by this layer
+    )
+
+# Rasterize and add layers to cost surface
+cost_surface += rasterize_layer(conservation_areas, transform, cost_surface.shape, 0.5)  # Low cost
+cost_surface += rasterize_layer(land_cover, transform, cost_surface.shape, 1)  # Neutral cost
+cost_surface += rasterize_layer(rivers, transform, cost_surface.shape, 3)  # Medium cost
+cost_surface += rasterize_layer(railroads, transform, cost_surface.shape, 5)  # Higher cost
+cost_surface += rasterize_layer(street_center_lines, transform, cost_surface.shape, 4)  # High cost
+cost_surface += rasterize_layer(street_edge, transform, cost_surface.shape, 4)  # High cost
+cost_surface += rasterize_layer(building_footprints, transform, cost_surface.shape, 8)  # Very high cost
+cost_surface += rasterize_layer(land_use, transform, cost_surface.shape, 1)  # Add based on your land use categories
+
+# Visualize the combined cost surface
+plt.figure(figsize=(10, 10))
+plt.imshow(cost_surface, cmap="viridis", origin="upper")
+plt.colorbar(label="Cost")
+plt.title("Combined Cost Surface")
+plt.show()
+
+# Compute the least-cost path
+# Example: Connect two conservation areas
+start_point = conservation_areas.geometry[0].centroid.coords[0]
+end_point = conservation_areas.geometry[1].centroid.coords[0]
+
+# Convert the grid to coordinates
+x_coords = np.linspace(bounds[0], bounds[2], width)
+y_coords = np.linspace(bounds[1], bounds[3], height)
+x_grid, y_grid = np.meshgrid(x_coords, y_coords)
+grid_coords = np.column_stack([x_grid.ravel(), y_grid.ravel()])
+
+# Build a graph for the grid
+graph = nx.grid_2d_graph(height, width)
+for node in graph.nodes:
+    row, col = node
+    graph.nodes[node]["cost"] = cost_surface[row, col]
+
+for edge in graph.edges:
+    node1, node2 = edge
+    cost1 = graph.nodes[node1]["cost"]
+    cost2 = graph.nodes[node2]["cost"]
+    graph.edges[node1, node2]["weight"] = (cost1 + cost2) / 2
+
+# Find start and end nodes
+start_idx = np.argmin(np.sum((grid_coords - start_point)**2, axis=1))
+end_idx = np.argmin(np.sum((grid_coords - end_point)**2, axis=1))
+start_node = tuple(np.unravel_index(start_idx, cost_surface.shape))
+end_node = tuple(np.unravel_index(end_idx, cost_surface.shape))
+
+# Calculate shortest path
+path = nx.shortest_path(graph, source=start_node, target=end_node, weight="weight")
+path_coords = [grid_coords[np.ravel_multi_index(node, cost_surface.shape)] for node in path]
+
+# Plot the least-cost path
+plt.imshow(cost_surface, cmap="viridis", origin="upper")
+plt.plot(*zip(*path_coords), color="blue", linewidth=2, label="Wildlife Corridor")
+plt.legend()
+plt.title("Optimal Wildlife Corridor")
+plt.show()
+
+# Save the path as a GeoJSON
+path_line = LineString(path_coords)
+gpd.GeoDataFrame({"geometry": [path_line]}, crs="EPSG:4326").to_file("wildlife_corridor.geojson", driver="GeoJSON")
